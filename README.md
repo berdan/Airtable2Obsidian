@@ -24,7 +24,7 @@ cp .env.sample .env
 Then edit `.env`:
 
 ```
-AIRTABLE_API_KEY=api_key_here
+AIRTABLE_PAT=your_personal_access_token_here
 AIRTABLE_BASE_ID=airtable_base_id_here
 AIRTABLE_TABLE_NAMES=table1,table2
 ```

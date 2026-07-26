@@ -164,7 +164,7 @@ class AirtableExporter:
 # Load configuration from the .env file
 load_dotenv()
 
-API_KEY = os.getenv('AIRTABLE_API_KEY')
+API_KEY = os.getenv('AIRTABLE_PAT')  # Use the personal access token from the .env file 
 BASE_ID = os.getenv('AIRTABLE_BASE_ID')
 # TABLE_NAMES is a comma-separated list in the .env file, e.g. Table1,Table2,Table3
 TABLE_NAMES = [name.strip() for name in os.getenv('AIRTABLE_TABLE_NAMES', '').split(',') if name.strip()]
@@ -172,7 +172,7 @@ TABLE_NAMES = [name.strip() for name in os.getenv('AIRTABLE_TABLE_NAMES', '').sp
 # Fail early with a clear message if any required setting is missing
 missing = [
     var for var, value in (
-        ('AIRTABLE_API_KEY', API_KEY),
+        ('AIRTABLE_PAT', API_KEY),
         ('AIRTABLE_BASE_ID', BASE_ID),
         ('AIRTABLE_TABLE_NAMES', TABLE_NAMES),
     ) if not value
