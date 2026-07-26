@@ -33,10 +33,13 @@ AIRTABLE_TABLE_NAMES=table1,table2
 
 ### Install & run
 
+This project uses [uv](https://docs.astral.sh/uv/). Once uv is installed, it will handle the virtual environment and dependencies for you:
+
 ```
-pip install -r requirements.txt
-python airtable_to_obsidian_g.py
+uv run airtable_to_obsidian_g.py
 ```
+
+`uv run` automatically creates the virtual environment and installs the locked dependencies on first use. To set up the environment without running the script, use `uv sync`.
 
 Also, in order to provide the linkage between records, the script now assumes that each record has a column called 'Title'. If this is not the case for your Airtable, either change the Airtable or change this in the code (`fields.Title`).
 
