@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Convert Airtable records into Obsidian-ready Markdown files"
 requires-python = ">=3.9"
 dependencies = [
-    "pandas>=2.3.3",
+    "pyairtable>=3.4.2",
     "python-dotenv>=1.2.1",
-    "requests>=2.32.5",
 ]
