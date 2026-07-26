@@ -1,0 +1,11 @@
+# Environment / secrets
+.env
+
+# Generated output
+id_to_title.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

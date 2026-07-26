@@ -13,14 +13,29 @@ The script works like this:
 - The script builds a dictionary of all records in the base, which it uses to make sure that any references to records are transformed into references between Markdown files
 - It transforms all records into Markdown, Obsidian ready, files by translating Airtable tags to Obsidian tags, and links between Airtable records to links between Obsidian Markdown files.
 
-You need to change the following values:
+### Configuration
 
-Before starting the script, change the below three values which can be found in your Airtable API documentation here: https://airtable.com/developers/web/api/introduction
+Configuration lives in a `.env` file (it is not committed to the repo). Copy the provided sample and fill in your own values, which can be found in your Airtable API documentation here: https://airtable.com/developers/web/api/introduction
 
 ```
-API_KEY = 'api_key_here'
-BASE_ID = 'airtable_base_id_here'
-TABLE_NAMES = ['tables_here_as_list']
+cp .env.sample .env
+```
+
+Then edit `.env`:
+
+```
+AIRTABLE_API_KEY=api_key_here
+AIRTABLE_BASE_ID=airtable_base_id_here
+AIRTABLE_TABLE_NAMES=table1,table2
+```
+
+`AIRTABLE_TABLE_NAMES` is a comma-separated list of the tables you want to export.
+
+### Install & run
+
+```
+pip install -r requirements.txt
+python airtable_to_obsidian_g.py
 ```
 
 Also, in order to provide the linkage between records, the script now assumes that each record has a column called 'Title'. If this is not the case for your Airtable, either change the Airtable or change this in the code (`fields.Title`).

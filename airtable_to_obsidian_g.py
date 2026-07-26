@@ -1,6 +1,7 @@
 import requests
 import pandas as pd
 import os
+from dotenv import load_dotenv
 
 class AirtableExporter:
     def __init__(self, api_key, base_id, table_names):
@@ -160,10 +161,28 @@ class AirtableExporter:
                     print(f"Error processing data for {i}: {e}")
                     break  # Exit the loop on any other exception
 
-# Initialize the exporter
-API_KEY = 'api_key_here'
-BASE_ID = 'airtable_base_id_here'
-TABLE_NAMES = ['tables_here_as_list']
+# Load configuration from the .env file
+load_dotenv()
 
+API_KEY = os.getenv('AIRTABLE_API_KEY')
+BASE_ID = os.getenv('AIRTABLE_BASE_ID')
+# TABLE_NAMES is a comma-separated list in the .env file, e.g. Table1,Table2,Table3
+TABLE_NAMES = [name.strip() for name in os.getenv('AIRTABLE_TABLE_NAMES', '').split(',') if name.strip()]
+
+# Fail early with a clear message if any required setting is missing
+missing = [
+    var for var, value in (
+        ('AIRTABLE_API_KEY', API_KEY),
+        ('AIRTABLE_BASE_ID', BASE_ID),
+        ('AIRTABLE_TABLE_NAMES', TABLE_NAMES),
+    ) if not value
+]
+if missing:
+    raise SystemExit(
+        f"Missing required setting(s): {', '.join(missing)}. "
+        "Copy .env.sample to .env and fill in your values."
+    )
+
+# Initialize the exporter
 exporter = AirtableExporter(API_KEY, BASE_ID, TABLE_NAMES)
 exporter.process_tables()
