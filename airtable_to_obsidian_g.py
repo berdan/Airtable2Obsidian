@@ -1,188 +1,414 @@
-import requests
-import pandas as pd
+"""Export every accessible Airtable base into Obsidian-ready Markdown.
+
+Discovers all bases and tables via the Airtable metadata API (using pyairtable),
+reads each table's schema so the primary field and field types are known, and
+writes one Markdown file per record laid out as:
+
+    <output_dir>/<base name>/<table name>/<record>.md
+
+Each note gets YAML frontmatter with one typed property per Airtable field
+(numbers, checkboxes, dates, lists and [[wikilinks]] kept as their real types)
+so the export works directly with Obsidian Bases, followed by a readable
+Markdown body. Linked records resolve to the linked record's primary field.
+"""
+
+import datetime
 import os
+import sys
+from pathlib import Path
+
+import yaml
 from dotenv import load_dotenv
+from pyairtable import Api
 
-class AirtableExporter:
-    def __init__(self, api_key, base_id, table_names):
-        self.api_key = api_key
-        self.base_id = base_id
-        self.table_names = table_names
-        self.id_to_title = {}
-        self.headers = {
-            'Authorization': f'Bearer {self.api_key}',
-        }
+# Characters that are not allowed in file/folder names on common filesystems.
+INVALID_CHARS = set('\\/:*?"<>|')
 
-    def build_id_to_title_mapping(self):
-        global id_to_title
-        # Iterate over each table to build the ID to title mapping
-        for i in self.table_names:
-            print(f'Building dictionary for {i}...')
-            url = f'https://api.airtable.com/v0/{self.base_id}/{i}'
+# Field types whose values we intentionally do not export.
+#   button / externalSyncSource : not real content
+#   createdBy / lastModifiedBy  : collaborator audit fields (contain emails -> PII)
+SKIP_FIELD_TYPES = {"button", "externalSyncSource", "createdBy", "lastModifiedBy"}
 
-            offset = None
-            while True:
-                if offset:
-                    response = requests.get(url, headers=self.headers, params={'offset': offset}, timeout=10)
-                else:
-                    response = requests.get(url, headers=self.headers, timeout=10)
+# Remember unknown field types we've warned about so we only warn once each.
+_warned_types = set()
 
-                if response.status_code != 200:
-                    print(f"Error fetching data for {i}: {response.status_code} - {response.text}")
-                    break
 
-                try:
-                    data = response.json()
-                    df = pd.json_normalize(data['records'])
+# --------------------------------------------------------------------------- #
+# Sanitization helpers
+# --------------------------------------------------------------------------- #
+def sanitize_name(name, max_len=200):
+    """Return a filesystem-safe name (for bases, tables and record titles)."""
+    cleaned = "".join(" " if c in INVALID_CHARS or c in "\r\n\t" else c for c in str(name))
+    # Collapse runs of whitespace, then trim leading/trailing whitespace and dots
+    # (trailing dots/spaces are hostile on Windows).
+    cleaned = " ".join(cleaned.split()).strip().strip(".").strip()
+    return cleaned[:max_len].strip()
 
-                    # Build the ID to title mapping for the current table
-                    for index, row in df.iterrows():
-                        record_id = row['id']
-                        title = row['fields.Title'][:200]  # This code assumes your first field is called Title, adjust if not the case
 
-                        if title is None:
-                            print(f"Skipping record {record_id} because the field Title is not filled.")
-                            continue
-                        # Ensure that the ID and title are strings
-                        if isinstance(record_id, str) and isinstance(title, str):
-                            # Sanitize the title to create a valid filename
-                            safe_title = ''.join(c if c not in ('\\', '/', ':', '*', '?', '"', '<', '>', '|') else ' ' for c in title).replace('\n', ' ')
-                            self.id_to_title[record_id] = safe_title
-                        else:
-                            # Convert to string if not already a string
-                            record_id_str = str(record_id) if not isinstance(record_id, str) else record_id
-                            title_str = str(title) if not isinstance(title, str) else title
+def unique_name(used, desired, record_id):
+    """Pick a collision-free name, appending the record id when needed.
 
-                            # Sanitize the title to create a valid filename
-                            safe_title = ''.join(c if c not in ('\\', '/', ':', '*', '?', '"', '<', '>', '|') else ' ' for c in title_str).replace('\n', ' ')
-                            self.id_to_title[record_id_str] = safe_title
+    Deterministic across re-runs: the same record always resolves to the same
+    name, so a second run overwrites rather than piling up new files.
+    """
+    name = desired or record_id
+    if name not in used:
+        used.add(name)
+        return name
+    name = f"{name} ({record_id})"
+    used.add(name)
+    return name
 
-                    offset = data.get('offset')
-                    if not offset:
-                        break
-                except KeyError:
-                    print(f"No records found for {i}.")
-                    break
-                except Exception as e:
-                    print(f"Error processing data for {i}: {e}")
-                    break
 
-        # After building the id_to_title mapping, write it to a text file
-        with open('id_to_title.txt', 'w', encoding='utf-8') as f:
-            for record_id, title in self.id_to_title.items():
-                f.write(f"{record_id}: {title}\n")
+# --------------------------------------------------------------------------- #
+# Field-value -> Markdown conversion (keyed on the schema field type)
+# --------------------------------------------------------------------------- #
+def _is_empty(value):
+    return value is None or value == "" or value == [] or value == {}
 
-    def load_id_to_title_mapping(self):
-        global id_to_title
+
+def _render_generic(value):
+    """Fallback rendering for scalars, lists and dicts of unknown shape."""
+    if isinstance(value, list):
+        return ", ".join(_render_generic(v) for v in value if not _is_empty(v))
+    if isinstance(value, dict):
+        # Prefer a human-friendly key if present, else a compact representation.
+        for key in ("name", "text", "value", "label", "url"):
+            if key in value:
+                return str(value[key])
+        return ", ".join(f"{k}: {v}" for k, v in value.items())
+    return str(value)
+
+
+def _collaborator_name(value):
+    """Name only for a collaborator dict -- never the email address (PII)."""
+    if isinstance(value, dict):
+        return str(value.get("name") or "").strip()
+    return str(value).strip()
+
+
+def convert_field(field_type, value, id_to_title):
+    """Convert one Airtable cell value to Markdown, or None to skip the field."""
+    if _is_empty(value):
+        return None
+
+    if field_type == "multipleRecordLinks":
+        ids = value if isinstance(value, list) else [value]
+        links = [f"[[{id_to_title.get(rid, rid)}]]" for rid in ids]
+        return " ".join(links) or None
+
+    if field_type == "singleSelect":
+        return str(value) or None
+
+    if field_type == "multipleSelects":
+        return ", ".join(str(v) for v in value if str(v)) or None
+
+    if field_type == "multipleAttachments":
+        links = []
+        for att in value if isinstance(value, list) else [value]:
+            if isinstance(att, dict) and att.get("url"):
+                links.append(f"[{att.get('filename', 'attachment')}]({att['url']})")
+        return " ".join(links) or None
+
+    if field_type == "singleCollaborator":
+        return _collaborator_name(value) or None
+
+    if field_type == "multipleCollaborators":
+        names = [_collaborator_name(v) for v in value if _collaborator_name(v)]
+        return ", ".join(names) or None
+
+    if field_type == "barcode":
+        return (value.get("text") if isinstance(value, dict) else str(value)) or None
+
+    if field_type == "aiText":
+        return (value.get("value") if isinstance(value, dict) else str(value)) or None
+
+    # Scalars, dates, formulas, rollups, lookups, counts and anything else:
+    # render generically. Warn once for types we've never seen so gaps surface.
+    if field_type not in _warned_types and field_type in ("unknown",):
+        _warned_types.add(field_type)
+        print(f"  ! Unrecognized field type '{field_type}', rendering as text.")
+    rendered = _render_generic(value)
+    return rendered or None
+
+
+# --------------------------------------------------------------------------- #
+# Field-value -> YAML frontmatter property (typed, for Obsidian Bases)
+# --------------------------------------------------------------------------- #
+NUMERIC_TYPES = {
+    "number", "percent", "currency", "rating", "duration", "autoNumber", "count",
+}
+
+
+def _parse_date(value):
+    try:
+        return datetime.date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _parse_datetime(value):
+    text = str(value).replace("Z", "+00:00")
+    try:
+        return datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _scalarize(value):
+    """Coerce a computed/unknown value to a YAML-friendly scalar."""
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, dict):
+        return _render_generic(value)
+    return str(value)
+
+
+def field_to_property(field_type, value, id_to_title):
+    """Convert a cell value to a typed Python value for YAML frontmatter.
+
+    Returns None to omit the property (Obsidian treats a missing property as
+    empty). Types are preserved so Bases can sort/filter numerically and by date,
+    and wikilinks are emitted as strings that PyYAML quotes correctly.
+    """
+    if _is_empty(value):
+        return None
+
+    if field_type == "multipleRecordLinks":
+        ids = value if isinstance(value, list) else [value]
+        return [f"[[{id_to_title.get(rid, rid)}]]" for rid in ids] or None
+
+    if field_type == "singleSelect":
+        return str(value) or None
+
+    if field_type == "multipleSelects":
+        return [str(v) for v in value if str(v)] or None
+
+    if field_type == "multipleAttachments":
+        urls = [
+            att["url"]
+            for att in (value if isinstance(value, list) else [value])
+            if isinstance(att, dict) and att.get("url")
+        ]
+        return urls or None
+
+    if field_type == "singleCollaborator":
+        return _collaborator_name(value) or None
+
+    if field_type == "multipleCollaborators":
+        return [n for n in (_collaborator_name(v) for v in value) if n] or None
+
+    if field_type == "barcode":
+        return (value.get("text") if isinstance(value, dict) else str(value)) or None
+
+    if field_type == "aiText":
+        return (value.get("value") if isinstance(value, dict) else str(value)) or None
+
+    if field_type == "checkbox":
+        return bool(value)
+
+    if field_type in NUMERIC_TYPES:
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else _scalarize(value)
+
+    if field_type == "date":
+        return _parse_date(value) or str(value)
+
+    if field_type in ("dateTime", "createdTime", "lastModifiedTime"):
+        return _parse_datetime(value) or str(value)
+
+    # formula / rollup / lookup / multipleLookupValues / anything else:
+    # preserve list-ness and native scalar types where possible.
+    if isinstance(value, list):
+        return [_scalarize(v) for v in value if not _is_empty(v)] or None
+    return _scalarize(value)
+
+
+def build_frontmatter(record, table, id_to_title):
+    """Build the YAML frontmatter block (including delimiters) for a record."""
+    props = {}
+    fields = record.get("fields", {})
+    for name in table["field_order"]:
+        field_type = table["field_types"][name]
+        if field_type in SKIP_FIELD_TYPES or name not in fields:
+            continue
+        prop = field_to_property(field_type, fields[name], id_to_title)
+        if prop is None or prop == "" or prop == []:
+            continue
+        props[name] = prop
+    if not props:
+        return ""
+    dumped = yaml.safe_dump(
+        props, allow_unicode=True, sort_keys=False, default_flow_style=False
+    )
+    return f"---\n{dumped}---\n\n"
+
+
+# --------------------------------------------------------------------------- #
+# Export orchestration
+# --------------------------------------------------------------------------- #
+def _primary_field_name(table_schema):
+    """Resolve a table's primary field name from its schema."""
+    for field in table_schema.fields:
+        if field.id == table_schema.primary_field_id:
+            return field.name
+    # Fallback: first field (Airtable guarantees a primary, so this is defensive).
+    return table_schema.fields[0].name if table_schema.fields else None
+
+
+def _primary_value_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return " ".join(_render_generic(v) for v in value)
+    return _render_generic(value)
+
+
+def discover(api):
+    """Pass 1: walk every base/table, cache records, build the recId->title map.
+
+    Returns (tables, id_to_title, stats) where `tables` is a list of dicts
+    holding everything pass 2 needs, so records are fetched only once.
+    """
+    tables = []
+    id_to_title = {}
+    stats = {"bases": 0, "tables": 0, "records": 0, "skipped_bases": 0}
+
+    for base in api.bases():
+        if getattr(base, "permission_level", None) == "none":
+            print(f"Skipping base {base.id} (no access).")
+            stats["skipped_bases"] += 1
+            continue
         try:
-            with open('id_to_title.txt', 'r', encoding='utf-8') as f:
-                for line in f:
-                    record_id, title = line.strip().split(': ', 1)
-                    self.id_to_title[record_id] = title
-        except Exception as e:
-            print(f"Error loading ID to title mapping: {e}")
+            base_name = base.name
+            base_tables = base.tables()
+        except Exception as e:  # 403 / scope / network issues for a whole base
+            print(f"Skipping base {base.id}: {e}")
+            stats["skipped_bases"] += 1
+            continue
 
-    def process_tables(self):
-        # Check if the id_to_title.txt file exists, and load it if it does, otherwise build it
-        if os.path.exists('id_to_title.txt'):
-            self.load_id_to_title_mapping()
-        else:
-            print(f'No dictionary found.')
-            self.build_id_to_title_mapping()
+        stats["bases"] += 1
+        print(f"Base: {base_name}")
+        for table in base_tables:
+            ts = table.schema()
+            primary = _primary_field_name(ts)
+            field_types = {f.name: f.type for f in ts.fields}
+            field_order = [f.name for f in ts.fields]
 
-        # Now process each table to create markdown files
-        for i in self.table_names:
-            print(f"Converting records in table {i} to Markdown")
-            url = f'https://api.airtable.com/v0/{self.base_id}/{i}'
+            print(f"  Reading table: {ts.name}")
+            records = table.all()
 
-            # Create a directory for the current table if it doesn't exist
-            os.makedirs(i, exist_ok=True)
+            for rec in records:
+                value = rec.get("fields", {}).get(primary)
+                title = sanitize_name(_primary_value_text(value)) or rec["id"]
+                id_to_title[rec["id"]] = title
 
-            offset = None
-            while True:
-                try:
-                    if offset:
-                        response = requests.get(url, headers=self.headers, params={'offset': offset}, timeout=10)
-                    else:
-                        response = requests.get(url, headers=self.headers, timeout=10)
+            tables.append(
+                {
+                    "base_id": base.id,
+                    "base_name": base_name,
+                    "table_name": ts.name,
+                    "primary": primary,
+                    "field_types": field_types,
+                    "field_order": field_order,
+                    "records": records,
+                }
+            )
+            stats["tables"] += 1
+            stats["records"] += len(records)
 
-                    if response.status_code != 200:
-                        print(f"Error fetching data for {i}: {response.status_code} - {response.text}")
-                        break
+    return tables, id_to_title, stats
 
-                    data = response.json()
-                    df = pd.json_normalize(data['records'])
 
-                    # Process each row to create markdown files, and make them Obsidian ready
-                    for index, row in df.iterrows():
-                        try:
-                            # Replace IDs in the row with corresponding titles using the global id_to_title mapping
-                            for col in df.columns:
-                                content = str(row[col])
-                                if content.startswith("['rec"):
-                                    new_content = []
-                                    for item in row[col]:
-                                        item = self.id_to_title.get(item, item)
-                                        new_content.append(item)
-                                    content = str(new_content)
-                                    content = content.replace('\']', ']]').replace('[\'', '[[').replace('\', \'', ']] [[')
+def record_markdown(record, table, id_to_title):
+    """Assemble the full Markdown body for a single record."""
+    fields = record.get("fields", {})
+    blocks = []
+    for name in table["field_order"]:
+        field_type = table["field_types"][name]
+        if field_type in SKIP_FIELD_TYPES or name not in fields:
+            continue
+        content = convert_field(field_type, fields[name], id_to_title)
+        if content:
+            blocks.append(f"## {name}\n{content}\n")
+    return "\n".join(blocks)
 
-                                elif content.startswith('rec'):
-                                    content = self.id_to_title.get(content, content)
-                                    content = content.replace('\']', ']]').replace('[\'', '[[').replace('\',', ']]')
 
-                                # Post-processing for content that starts with "['"
-                                elif content.startswith("['"):
-                                    content = content.replace("[\'", "#")
-                                    if content.startswith("#"):
-                                        content = content.replace(" ", "_").replace("\',_\'", " #").replace("\']", "")
-                                # Sanitize the title to create a valid filename
-                                safe_title = ''.join(c if c not in ('\\', '/', ':', '*', '?', '"', '<', '>', '|') else ' ' for c in row['fields.Title'][:200]).replace('\n', ' ')
-                                filename = os.path.join(i, f"{safe_title}.md")
+def _inside(root, path):
+    """Return `path` if it resolves inside `root`, else refuse to write there."""
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root):
+        raise SystemExit(f"Refusing to write outside '{root}': {resolved}")
+    return path
 
-                                # Write the content to the markdown file without any changes
-                                with open(filename, 'a', encoding='utf-8') as f:  # Specify UTF-8 encoding
-                                    if col not in ['id', 'createdTime', 'fields.lastModified', 'fields.Created By.id', 'fields.Created By.email', 'fields.Created By.name']:
-                                        col = col.replace('fields.', '')
-                                        f.write(f"## {col}\n{content}\n\n")  # Write column title and original value
 
-                        except Exception as e:
-                            print(f"Error processing record for {i}: {e} on {row['fields.Title']}")
-                            continue
+def write(tables, id_to_title, output_dir):
+    """Pass 2: write one Markdown file per record from the cached data."""
+    output_dir = Path(output_dir)
+    root = output_dir.resolve()
+    used_base_dirs = set()
+    base_dirs = {}  # base_id -> Path (so tables under the same base share a folder)
+    files_written = 0
 
-                    # Check for the presence of an offset in the response to continue fetching
-                    offset = data.get('offset')
-                    if not offset:  # Break the loop if no more records are available
-                        break
-                except KeyError:
-                    print(f"No records found for {i}.")
-                    break  # Exit the loop if no records are found
-                except Exception as e:
-                    print(f"Error processing data for {i}: {e}")
-                    break  # Exit the loop on any other exception
+    for table in tables:
+        if not table["records"]:
+            print(f"  (skipping empty table {table['base_name']}/{table['table_name']})")
+            continue
 
-# Load configuration from the .env file
-load_dotenv()
+        # Key and disambiguate by base id: names are user-controlled and may
+        # collide or sanitize to nothing, and must never reach the path unsanitized.
+        base_id = table["base_id"]
+        if base_id not in base_dirs:
+            folder = unique_name(used_base_dirs, sanitize_name(table["base_name"]), base_id)
+            base_dirs[base_id] = output_dir / folder
+        base_dir = base_dirs[base_id]
 
-API_KEY = os.getenv('AIRTABLE_PAT')  # Use the personal access token from the .env file 
-BASE_ID = os.getenv('AIRTABLE_BASE_ID')
-# TABLE_NAMES is a comma-separated list in the .env file, e.g. Table1,Table2,Table3
-TABLE_NAMES = [name.strip() for name in os.getenv('AIRTABLE_TABLE_NAMES', '').split(',') if name.strip()]
+        table_dir = _inside(root, base_dir / (sanitize_name(table["table_name"]) or "table"))
+        table_dir.mkdir(parents=True, exist_ok=True)
 
-# Fail early with a clear message if any required setting is missing
-missing = [
-    var for var, value in (
-        ('AIRTABLE_PAT', API_KEY),
-        ('AIRTABLE_BASE_ID', BASE_ID),
-        ('AIRTABLE_TABLE_NAMES', TABLE_NAMES),
-    ) if not value
-]
-if missing:
-    raise SystemExit(
-        f"Missing required setting(s): {', '.join(missing)}. "
-        "Copy .env.sample to .env and fill in your values."
+        used_files = set()
+        for rec in table["records"]:
+            title = id_to_title.get(rec["id"], rec["id"])
+            filename = unique_name(used_files, title, rec["id"])
+            frontmatter = build_frontmatter(rec, table, id_to_title)
+            body = record_markdown(rec, table, id_to_title)
+            # 'w' via write_text: re-runs refresh content instead of duplicating it.
+            _inside(root, table_dir / f"{filename}.md").write_text(frontmatter + body, encoding="utf-8")
+            files_written += 1
+
+    return files_written
+
+
+def main():
+    load_dotenv()
+
+    pat = os.getenv("AIRTABLE_PAT")
+    if not pat:
+        raise SystemExit(
+            "Missing required setting: AIRTABLE_PAT. "
+            "Copy .env.sample to .env and fill in your value."
+        )
+    output_dir = os.getenv("A2O_OUTPUT_DIR", "export")
+
+    api = Api(pat)
+    try:
+        tables, id_to_title, stats = discover(api)
+    except Exception as e:
+        # Most commonly an invalid/expired token or a missing schema.bases:read scope.
+        raise SystemExit(
+            f"Failed to read from Airtable: {e}\n"
+            "Check that AIRTABLE_PAT is valid and has the scopes "
+            "'schema.bases:read' and 'data.records:read'."
+        )
+
+    files_written = write(tables, id_to_title, output_dir)
+
+    print(
+        "\nDone. "
+        f"{stats['bases']} base(s), {stats['tables']} table(s), "
+        f"{stats['records']} record(s) -> {files_written} file(s) in '{output_dir}/'."
+        + (f" Skipped {stats['skipped_bases']} base(s)." if stats["skipped_bases"] else "")
     )
 
-# Initialize the exporter
-exporter = AirtableExporter(API_KEY, BASE_ID, TABLE_NAMES)
-exporter.process_tables()
+
+if __name__ == "__main__":
+    main()
