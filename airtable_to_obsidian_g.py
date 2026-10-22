@@ -6,14 +6,18 @@ writes one Markdown file per record laid out as:
 
     <output_dir>/<base name>/<table name>/<record>.md
 
-Linked records become [[wikilinks]] (resolved to the linked record's primary
-field) and select fields become #tags, so the export is Obsidian-ready.
+Each note gets YAML frontmatter with one typed property per Airtable field
+(numbers, checkboxes, dates, lists and [[wikilinks]] kept as their real types)
+so the export works directly with Obsidian Bases, followed by a readable
+Markdown body. Linked records resolve to the linked record's primary field.
 """
 
+import datetime
 import os
 import sys
 from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
 from pyairtable import Api
 
@@ -39,13 +43,6 @@ def sanitize_name(name, max_len=200):
     # (trailing dots/spaces are hostile on Windows).
     cleaned = " ".join(cleaned.split()).strip().strip(".").strip()
     return cleaned[:max_len].strip()
-
-
-def sanitize_tag(value):
-    """Turn a select-option string into an Obsidian tag body (no leading #)."""
-    tag = str(value).strip().lstrip("#")
-    tag = "".join("_" if c in INVALID_CHARS or c.isspace() else c for c in tag)
-    return "_".join(filter(None, tag.split("_")))
 
 
 def unique_name(used, desired, record_id):
@@ -101,12 +98,10 @@ def convert_field(field_type, value, id_to_title):
         return " ".join(links) or None
 
     if field_type == "singleSelect":
-        tag = sanitize_tag(value)
-        return f"#{tag}" if tag else None
+        return str(value) or None
 
     if field_type == "multipleSelects":
-        tags = [f"#{sanitize_tag(v)}" for v in value if sanitize_tag(v)]
-        return " ".join(tags) or None
+        return ", ".join(str(v) for v in value if str(v)) or None
 
     if field_type == "multipleAttachments":
         links = []
@@ -135,6 +130,117 @@ def convert_field(field_type, value, id_to_title):
         print(f"  ! Unrecognized field type '{field_type}', rendering as text.")
     rendered = _render_generic(value)
     return rendered or None
+
+
+# --------------------------------------------------------------------------- #
+# Field-value -> YAML frontmatter property (typed, for Obsidian Bases)
+# --------------------------------------------------------------------------- #
+NUMERIC_TYPES = {
+    "number", "percent", "currency", "rating", "duration", "autoNumber", "count",
+}
+
+
+def _parse_date(value):
+    try:
+        return datetime.date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _parse_datetime(value):
+    text = str(value).replace("Z", "+00:00")
+    try:
+        return datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _scalarize(value):
+    """Coerce a computed/unknown value to a YAML-friendly scalar."""
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, dict):
+        return _render_generic(value)
+    return str(value)
+
+
+def field_to_property(field_type, value, id_to_title):
+    """Convert a cell value to a typed Python value for YAML frontmatter.
+
+    Returns None to omit the property (Obsidian treats a missing property as
+    empty). Types are preserved so Bases can sort/filter numerically and by date,
+    and wikilinks are emitted as strings that PyYAML quotes correctly.
+    """
+    if _is_empty(value):
+        return None
+
+    if field_type == "multipleRecordLinks":
+        ids = value if isinstance(value, list) else [value]
+        return [f"[[{id_to_title.get(rid, rid)}]]" for rid in ids] or None
+
+    if field_type == "singleSelect":
+        return str(value) or None
+
+    if field_type == "multipleSelects":
+        return [str(v) for v in value if str(v)] or None
+
+    if field_type == "multipleAttachments":
+        urls = [
+            att["url"]
+            for att in (value if isinstance(value, list) else [value])
+            if isinstance(att, dict) and att.get("url")
+        ]
+        return urls or None
+
+    if field_type == "singleCollaborator":
+        return _collaborator_name(value) or None
+
+    if field_type == "multipleCollaborators":
+        return [n for n in (_collaborator_name(v) for v in value) if n] or None
+
+    if field_type == "barcode":
+        return (value.get("text") if isinstance(value, dict) else str(value)) or None
+
+    if field_type == "aiText":
+        return (value.get("value") if isinstance(value, dict) else str(value)) or None
+
+    if field_type == "checkbox":
+        return bool(value)
+
+    if field_type in NUMERIC_TYPES:
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else _scalarize(value)
+
+    if field_type == "date":
+        return _parse_date(value) or str(value)
+
+    if field_type in ("dateTime", "createdTime", "lastModifiedTime"):
+        return _parse_datetime(value) or str(value)
+
+    # formula / rollup / lookup / multipleLookupValues / anything else:
+    # preserve list-ness and native scalar types where possible.
+    if isinstance(value, list):
+        return [_scalarize(v) for v in value if not _is_empty(v)] or None
+    return _scalarize(value)
+
+
+def build_frontmatter(record, table, id_to_title):
+    """Build the YAML frontmatter block (including delimiters) for a record."""
+    props = {}
+    fields = record.get("fields", {})
+    for name in table["field_order"]:
+        field_type = table["field_types"][name]
+        if field_type in SKIP_FIELD_TYPES or name not in fields:
+            continue
+        prop = field_to_property(field_type, fields[name], id_to_title)
+        if prop is None or prop == "" or prop == []:
+            continue
+        props[name] = prop
+    if not props:
+        return ""
+    dumped = yaml.safe_dump(
+        props, allow_unicode=True, sort_keys=False, default_flow_style=False
+    )
+    return f"---\n{dumped}---\n\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -263,9 +369,10 @@ def write(tables, id_to_title, output_dir):
         for rec in table["records"]:
             title = id_to_title.get(rec["id"], rec["id"])
             filename = unique_name(used_files, title, rec["id"])
+            frontmatter = build_frontmatter(rec, table, id_to_title)
             body = record_markdown(rec, table, id_to_title)
             # 'w' via write_text: re-runs refresh content instead of duplicating it.
-            _inside(root, table_dir / f"{filename}.md").write_text(body, encoding="utf-8")
+            _inside(root, table_dir / f"{filename}.md").write_text(frontmatter + body, encoding="utf-8")
             files_written += 1
 
     return files_written

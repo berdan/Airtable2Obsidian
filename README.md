@@ -12,7 +12,29 @@ The script works like this:
 - It **automatically discovers every base and table** your token can access — no need to list them.
 - Each base becomes a top-level folder, each table a sub-folder, and each record a separate Markdown file: `export/<base>/<table>/<record>.md`
 - It reads each table's schema, so the note title comes from the table's actual **primary field** (no assumptions about a "Title" column).
-- Using the field types from the schema, it translates Airtable select fields to Obsidian **#tags** and links between records to Obsidian **[[wikilinks]]**, so your notes stay linked and tagged.
+- Every field is written as a typed **YAML frontmatter property**, so the export works directly with [Obsidian Bases](https://help.obsidian.md/bases). Numbers, checkboxes and dates keep their real types (so Bases can sort/filter them), multi-value fields become lists, and linked records become `[[wikilink]]` list properties. A readable Markdown body follows the frontmatter.
+
+Example note:
+
+```markdown
+---
+Name: Canon RF 50mm
+Price: 649
+Discontinued: false
+Purchased: 2023-05-01
+Mount:
+  - "[[RF Mount]]"
+Categories:
+  - Prime
+  - Portrait
+---
+
+## Name
+Canon RF 50mm
+
+## Mount
+[[RF Mount]]
+```
 
 ### Configuration
 
