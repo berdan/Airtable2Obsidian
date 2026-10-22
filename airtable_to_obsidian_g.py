@@ -198,6 +198,7 @@ def discover(api):
 
             tables.append(
                 {
+                    "base_id": base.id,
                     "base_name": base_name,
                     "table_name": ts.name,
                     "primary": primary,
@@ -226,11 +227,20 @@ def record_markdown(record, table, id_to_title):
     return "\n".join(blocks)
 
 
+def _inside(root, path):
+    """Return `path` if it resolves inside `root`, else refuse to write there."""
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root):
+        raise SystemExit(f"Refusing to write outside '{root}': {resolved}")
+    return path
+
+
 def write(tables, id_to_title, output_dir):
     """Pass 2: write one Markdown file per record from the cached data."""
     output_dir = Path(output_dir)
+    root = output_dir.resolve()
     used_base_dirs = set()
-    base_dirs = {}  # base_name -> Path (so tables under the same base share a folder)
+    base_dirs = {}  # base_id -> Path (so tables under the same base share a folder)
     files_written = 0
 
     for table in tables:
@@ -238,13 +248,15 @@ def write(tables, id_to_title, output_dir):
             print(f"  (skipping empty table {table['base_name']}/{table['table_name']})")
             continue
 
-        base_name = table["base_name"]
-        if base_name not in base_dirs:
-            folder = unique_name(used_base_dirs, sanitize_name(base_name), base_name)
-            base_dirs[base_name] = output_dir / folder
-        base_dir = base_dirs[base_name]
+        # Key and disambiguate by base id: names are user-controlled and may
+        # collide or sanitize to nothing, and must never reach the path unsanitized.
+        base_id = table["base_id"]
+        if base_id not in base_dirs:
+            folder = unique_name(used_base_dirs, sanitize_name(table["base_name"]), base_id)
+            base_dirs[base_id] = output_dir / folder
+        base_dir = base_dirs[base_id]
 
-        table_dir = base_dir / (sanitize_name(table["table_name"]) or "table")
+        table_dir = _inside(root, base_dir / (sanitize_name(table["table_name"]) or "table"))
         table_dir.mkdir(parents=True, exist_ok=True)
 
         used_files = set()
@@ -253,7 +265,7 @@ def write(tables, id_to_title, output_dir):
             filename = unique_name(used_files, title, rec["id"])
             body = record_markdown(rec, table, id_to_title)
             # 'w' via write_text: re-runs refresh content instead of duplicating it.
-            (table_dir / f"{filename}.md").write_text(body, encoding="utf-8")
+            _inside(root, table_dir / f"{filename}.md").write_text(body, encoding="utf-8")
             files_written += 1
 
     return files_written
