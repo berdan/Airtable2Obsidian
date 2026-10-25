@@ -3,6 +3,7 @@
 
 # Generated output
 export/
+export-*/
 
 # Python
 __pycache__/

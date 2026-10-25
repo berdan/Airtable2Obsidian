@@ -8,21 +8,42 @@ writes one Markdown file per record laid out as:
 
 Each note gets YAML frontmatter with one typed property per Airtable field
 (numbers, checkboxes, dates, lists and [[wikilinks]] kept as their real types)
-so the export works directly with Obsidian Bases, followed by a readable
-Markdown body. Linked records resolve to the linked record's primary field.
+so the export works directly with Obsidian Bases. Linked records resolve to the
+linked record's note name. Attachments are downloaded into one shared folder
+and referenced as [[file]] embeds, since Airtable's attachment URLs expire.
+The note body is configurable (see A2O_BODY in .env.sample).
 """
 
 import datetime
+import mimetypes
 import os
-import sys
+import unicodedata
+import urllib.request
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
 from pyairtable import Api
 
-# Characters that are not allowed in file/folder names on common filesystems.
-INVALID_CHARS = set('\\/:*?"<>|')
+# Characters that break an Obsidian [[wikilink]]: '#' starts a heading link (it is
+# dropped), the rest are link syntax or path separators (replaced with '-').
+LINK_DROP_CHARS = set("#")
+LINK_DASH_CHARS = set("^[]|\\/:")
+# Not allowed in file/folder names on Windows.
+INVALID_CHARS = set('*?"<>')
+
+# Code point ranges treated as emoji when A2O_STRIP_EMOJI is on: pictographs,
+# misc symbols/dingbats, a few watch/hourglass symbols, plus the joiners and
+# variation selectors that glue emoji sequences together.
+EMOJI_RANGES = (
+    (0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF),
+    (0x231A, 0x231B), (0x23E9, 0x23F3), (0x23F8, 0x23FA),
+    (0xFE00, 0xFE0F), (0x200D, 0x200D), (0x20E3, 0x20E3), (0xE0020, 0xE007F),
+)
+
+# Note body modes for A2O_BODY; any other value names a field to use as the body.
+BODY_FIELDS = "fields"
+BODY_NONE = "none"
 
 # Field types whose values we intentionally do not export.
 #   button / externalSyncSource : not real content
@@ -36,13 +57,42 @@ _warned_types = set()
 # --------------------------------------------------------------------------- #
 # Sanitization helpers
 # --------------------------------------------------------------------------- #
-def sanitize_name(name, max_len=200):
-    """Return a filesystem-safe name (for bases, tables and record titles)."""
-    cleaned = "".join(" " if c in INVALID_CHARS or c in "\r\n\t" else c for c in str(name))
+def strip_emoji(name):
+    """Remove emoji, keeping the original if nothing else is left."""
+    stripped = "".join(
+        c for c in name if not any(lo <= ord(c) <= hi for lo, hi in EMOJI_RANGES)
+    )
+    stripped = " ".join(stripped.split())
+    return stripped or name
+
+
+def sanitize_name(name, max_len=150):
+    """Return a filesystem- and wikilink-safe name (bases, tables, notes, files)."""
+    cleaned = []
+    for c in unicodedata.normalize("NFC", str(name)):
+        if c in LINK_DROP_CHARS:
+            continue
+        if c in LINK_DASH_CHARS:
+            cleaned.append("-")
+        elif c in INVALID_CHARS or c in "\r\n\t":
+            cleaned.append(" ")
+        else:
+            cleaned.append(c)
     # Collapse runs of whitespace, then trim leading/trailing whitespace and dots
-    # (trailing dots/spaces are hostile on Windows).
-    cleaned = " ".join(cleaned.split()).strip().strip(".").strip()
+    # (trailing dots/spaces are hostile on Windows, leading dots hide files).
+    cleaned = " ".join("".join(cleaned).split()).strip().strip(".").strip()
     return cleaned[:max_len].strip()
+
+
+def property_name(name, strip_emojis=False):
+    """Normalize a field name for frontmatter: trim (incl. NBSP), collapse spaces."""
+    name = " ".join(str(name).replace("\u200b", "").replace("\ufeff", "").split())
+    return strip_emoji(name) if strip_emojis else name
+
+
+def _name_key(name):
+    # Obsidian and macOS/Windows filesystems match names case-insensitively.
+    return unicodedata.normalize("NFC", name).casefold()
 
 
 def unique_name(used, desired, record_id):
@@ -52,12 +102,76 @@ def unique_name(used, desired, record_id):
     name, so a second run overwrites rather than piling up new files.
     """
     name = desired or record_id
-    if name not in used:
-        used.add(name)
+    if _name_key(name) not in used:
+        used.add(_name_key(name))
         return name
     name = f"{name} ({record_id})"
-    used.add(name)
+    used.add(_name_key(name))
     return name
+
+
+# --------------------------------------------------------------------------- #
+# Attachments: downloaded once into a shared folder, referenced by filename
+# --------------------------------------------------------------------------- #
+def _is_attachment(value):
+    return isinstance(value, dict) and "url" in value and "filename" in value
+
+
+class Attachments:
+    """Downloads attachments and hands out stable, unique, link-safe filenames.
+
+    Files are named "<note name> - <original filename>", with a counter when two
+    attachments would share a name. An existing file of the expected size is
+    reused, so re-runs only download what is new or changed.
+    """
+
+    def __init__(self, folder, root):
+        self.folder = Path(folder)
+        self.root = root
+        self.by_id = {}  # attachment id -> filename (lookups reuse the same file)
+        self.used = set()
+        self.stats = {"downloaded": 0, "reused": 0, "failed": 0}
+
+    def filenames(self, value, note_name):
+        atts = value if isinstance(value, list) else [value]
+        return [self._filename(att, note_name) for att in atts if _is_attachment(att)]
+
+    def _filename(self, att, note_name):
+        att_id = att.get("id") or att["url"]
+        if att_id in self.by_id:
+            return self.by_id[att_id]
+
+        original = Path(str(att.get("filename") or "attachment"))
+        ext = original.suffix or mimetypes.guess_extension(att.get("type") or "") or ""
+        # Sanitize without the dot: sanitize_name strips leading dots.
+        ext = sanitize_name(ext.lstrip(".")).replace(" ", "")
+        ext = f".{ext.lower()}" if ext else ""
+        stem = sanitize_name(f"{note_name} - {original.stem}") or att_id
+        filename, counter = f"{stem}{ext}", 2
+        while _name_key(filename) in self.used:
+            filename, counter = f"{stem} {counter}{ext}", counter + 1
+        self.used.add(_name_key(filename))
+        self.by_id[att_id] = filename
+
+        self._download(att, _inside(self.root, self.folder / filename))
+        return filename
+
+    def _download(self, att, path):
+        size = att.get("size")
+        if path.exists() and (size is None or path.stat().st_size == size):
+            self.stats["reused"] += 1
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        part = path.with_name(path.name + ".part")
+        try:
+            with urllib.request.urlopen(att["url"], timeout=60) as resp:
+                part.write_bytes(resp.read())
+            part.replace(path)
+            self.stats["downloaded"] += 1
+        except Exception as e:  # keep exporting; the embed stays and a re-run retries
+            part.unlink(missing_ok=True)
+            self.stats["failed"] += 1
+            print(f"  ! Could not download attachment for {path.name}: {e}")
 
 
 # --------------------------------------------------------------------------- #
@@ -87,8 +201,11 @@ def _collaborator_name(value):
     return str(value).strip()
 
 
-def convert_field(field_type, value, id_to_title):
-    """Convert one Airtable cell value to Markdown, or None to skip the field."""
+def convert_field(field_type, value, id_to_title, attachment_names):
+    """Convert one Airtable cell value to Markdown, or None to skip the field.
+
+    `attachment_names` maps an attachment value to its downloaded filenames.
+    """
     if _is_empty(value):
         return None
 
@@ -103,12 +220,10 @@ def convert_field(field_type, value, id_to_title):
     if field_type == "multipleSelects":
         return ", ".join(str(v) for v in value if str(v)) or None
 
-    if field_type == "multipleAttachments":
-        links = []
-        for att in value if isinstance(value, list) else [value]:
-            if isinstance(att, dict) and att.get("url"):
-                links.append(f"[{att.get('filename', 'attachment')}]({att['url']})")
-        return " ".join(links) or None
+    if field_type == "multipleAttachments" or (
+        isinstance(value, list) and value and all(_is_attachment(v) for v in value)
+    ):
+        return " ".join(f"![[{name}]]" for name in attachment_names(value)) or None
 
     if field_type == "singleCollaborator":
         return _collaborator_name(value) or None
@@ -164,7 +279,7 @@ def _scalarize(value):
     return str(value)
 
 
-def field_to_property(field_type, value, id_to_title):
+def field_to_property(field_type, value, id_to_title, attachment_names):
     """Convert a cell value to a typed Python value for YAML frontmatter.
 
     Returns None to omit the property (Obsidian treats a missing property as
@@ -184,13 +299,11 @@ def field_to_property(field_type, value, id_to_title):
     if field_type == "multipleSelects":
         return [str(v) for v in value if str(v)] or None
 
-    if field_type == "multipleAttachments":
-        urls = [
-            att["url"]
-            for att in (value if isinstance(value, list) else [value])
-            if isinstance(att, dict) and att.get("url")
-        ]
-        return urls or None
+    # Attachment fields, and lookups of attachment fields.
+    if field_type == "multipleAttachments" or (
+        isinstance(value, list) and value and all(_is_attachment(v) for v in value)
+    ):
+        return [f"[[{name}]]" for name in attachment_names(value)] or None
 
     if field_type == "singleCollaborator":
         return _collaborator_name(value) or None
@@ -223,23 +336,24 @@ def field_to_property(field_type, value, id_to_title):
     return _scalarize(value)
 
 
-def build_frontmatter(record, table, id_to_title):
+def build_frontmatter(record, table, id_to_title, attachment_names):
     """Build the YAML frontmatter block (including delimiters) for a record."""
     props = {}
     fields = record.get("fields", {})
     for name in table["field_order"]:
         field_type = table["field_types"][name]
-        if field_type in SKIP_FIELD_TYPES or name not in fields:
+        if field_type in SKIP_FIELD_TYPES or name not in fields or name == table["body_field"]:
             continue
-        prop = field_to_property(field_type, fields[name], id_to_title)
+        prop = field_to_property(field_type, fields[name], id_to_title, attachment_names)
         if prop is None or prop == "" or prop == []:
             continue
-        props[name] = prop
-    if not props:
-        return ""
+        if name in table["float_fields"] and type(prop) is int:
+            prop = float(prop)
+        props[table["props"][name]] = prop
+    # Always emit the block, even when empty, so every note has frontmatter.
     dumped = yaml.safe_dump(
         props, allow_unicode=True, sort_keys=False, default_flow_style=False
-    )
+    ) if props else ""
     return f"---\n{dumped}---\n\n"
 
 
@@ -263,14 +377,32 @@ def _primary_value_text(value):
     return _render_generic(value)
 
 
-def discover(api):
+def _property_names(field_order, strip_emojis):
+    """Map each field name to a normalized, unique frontmatter property name."""
+    props, used = {}, set()
+    for name in field_order:
+        prop = base = property_name(name, strip_emojis) or name
+        counter = 2
+        while _name_key(prop) in used:
+            prop, counter = f"{base} {counter}", counter + 1
+        used.add(_name_key(prop))
+        props[name] = prop
+    return props
+
+
+def discover(api, config):
     """Pass 1: walk every base/table, cache records, build the recId->title map.
+
+    Note names are made unique across the whole export (Obsidian resolves
+    [[links]] by name, regardless of folder), and the same names are used both
+    for filenames and as link targets so every link resolves.
 
     Returns (tables, id_to_title, stats) where `tables` is a list of dicts
     holding everything pass 2 needs, so records are fetched only once.
     """
     tables = []
     id_to_title = {}
+    used_notes = set()
     stats = {"bases": 0, "tables": 0, "records": 0, "skipped_bases": 0}
 
     for base in api.bases():
@@ -293,14 +425,28 @@ def discover(api):
             primary = _primary_field_name(ts)
             field_types = {f.name: f.type for f in ts.fields}
             field_order = [f.name for f in ts.fields]
+            # Numbers with decimal places: Airtable returns whole values as ints
+            # (12 vs 12.5), so these are written as floats for a consistent type.
+            float_fields = {
+                f.name for f in ts.fields
+                if f.type in ("number", "currency", "percent")
+                and getattr(getattr(f, "options", None), "precision", 0)
+            }
+            props = _property_names(field_order, config["strip_emoji"])
+            body = config["body"]
+            body_field = None
+            if body not in (BODY_FIELDS, BODY_NONE):
+                body_field = next(
+                    (n for n in field_order if body in (n, props[n])), None
+                )
 
             print(f"  Reading table: {ts.name}")
             records = table.all()
 
             for rec in records:
                 value = rec.get("fields", {}).get(primary)
-                title = sanitize_name(_primary_value_text(value)) or rec["id"]
-                id_to_title[rec["id"]] = title
+                title = sanitize_name(_primary_value_text(value))
+                id_to_title[rec["id"]] = unique_name(used_notes, title, rec["id"])
 
             tables.append(
                 {
@@ -310,6 +456,9 @@ def discover(api):
                     "primary": primary,
                     "field_types": field_types,
                     "field_order": field_order,
+                    "float_fields": float_fields,
+                    "props": props,
+                    "body_field": body_field,
                     "records": records,
                 }
             )
@@ -319,17 +468,25 @@ def discover(api):
     return tables, id_to_title, stats
 
 
-def record_markdown(record, table, id_to_title):
-    """Assemble the full Markdown body for a single record."""
+def record_markdown(record, table, id_to_title, attachment_names, body):
+    """Assemble the Markdown body for a single record according to A2O_BODY."""
     fields = record.get("fields", {})
+    if body == BODY_NONE:
+        return ""
+    if body != BODY_FIELDS:
+        name = table["body_field"]
+        if name is None or name not in fields:
+            return ""
+        content = convert_field(table["field_types"][name], fields[name], id_to_title, attachment_names)
+        return f"{content}\n" if content else ""
     blocks = []
     for name in table["field_order"]:
         field_type = table["field_types"][name]
         if field_type in SKIP_FIELD_TYPES or name not in fields:
             continue
-        content = convert_field(field_type, fields[name], id_to_title)
+        content = convert_field(field_type, fields[name], id_to_title, attachment_names)
         if content:
-            blocks.append(f"## {name}\n{content}\n")
+            blocks.append(f"## {table['props'][name]}\n{content}\n")
     return "\n".join(blocks)
 
 
@@ -341,11 +498,18 @@ def _inside(root, path):
     return path
 
 
-def write(tables, id_to_title, output_dir):
-    """Pass 2: write one Markdown file per record from the cached data."""
-    output_dir = Path(output_dir)
+def write(tables, id_to_title, config):
+    """Pass 2: write one Markdown file per record from the cached data.
+
+    Everything is written inside the output directory; nothing is deleted.
+    """
+    output_dir = Path(config["output_dir"])
     root = output_dir.resolve()
+    attachments = Attachments(config["attachments_dir"], root)
     used_base_dirs = set()
+    if attachments.folder.resolve().parent == root:
+        # Don't let a base folder share a name with the attachments folder.
+        used_base_dirs.add(_name_key(attachments.folder.name))
     base_dirs = {}  # base_id -> Path (so tables under the same base share a folder)
     files_written = 0
 
@@ -358,24 +522,37 @@ def write(tables, id_to_title, output_dir):
         # collide or sanitize to nothing, and must never reach the path unsanitized.
         base_id = table["base_id"]
         if base_id not in base_dirs:
-            folder = unique_name(used_base_dirs, sanitize_name(table["base_name"]), base_id)
+            base_name = table["base_name"]
+            if config["strip_emoji"]:
+                base_name = strip_emoji(base_name)
+            folder = unique_name(used_base_dirs, sanitize_name(base_name), base_id)
             base_dirs[base_id] = output_dir / folder
         base_dir = base_dirs[base_id]
 
-        table_dir = _inside(root, base_dir / (sanitize_name(table["table_name"]) or "table"))
+        table_name = table["table_name"]
+        if config["strip_emoji"]:
+            table_name = strip_emoji(table_name)
+        table_dir = _inside(root, base_dir / (sanitize_name(table_name) or "table"))
         table_dir.mkdir(parents=True, exist_ok=True)
 
-        used_files = set()
         for rec in table["records"]:
-            title = id_to_title.get(rec["id"], rec["id"])
-            filename = unique_name(used_files, title, rec["id"])
-            frontmatter = build_frontmatter(rec, table, id_to_title)
-            body = record_markdown(rec, table, id_to_title)
+            # Already unique across the whole export (see discover()).
+            filename = id_to_title[rec["id"]]
+
+            def attachment_names(value, note=filename):
+                return attachments.filenames(value, note)
+
+            frontmatter = build_frontmatter(rec, table, id_to_title, attachment_names)
+            body = record_markdown(rec, table, id_to_title, attachment_names, config["body"])
             # 'w' via write_text: re-runs refresh content instead of duplicating it.
             _inside(root, table_dir / f"{filename}.md").write_text(frontmatter + body, encoding="utf-8")
             files_written += 1
 
-    return files_written
+    return files_written, attachments.stats
+
+
+def _env_flag(name):
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def main():
@@ -387,11 +564,21 @@ def main():
             "Missing required setting: AIRTABLE_PAT. "
             "Copy .env.sample to .env and fill in your value."
         )
-    output_dir = os.getenv("A2O_OUTPUT_DIR", "export")
+    output_dir = os.getenv("A2O_OUTPUT_DIR") or "export"
+    config = {
+        "output_dir": output_dir,
+        "attachments_dir": os.getenv("A2O_ATTACHMENTS_DIR") or str(Path(output_dir) / "_attachments"),
+        "body": (os.getenv("A2O_BODY") or BODY_NONE).strip(),
+        "strip_emoji": _env_flag("A2O_STRIP_EMOJI"),
+    }
+    if config["body"].lower() in (BODY_FIELDS, BODY_NONE):
+        config["body"] = config["body"].lower()
+    # Fail before touching the network if attachments would land outside the export.
+    _inside(Path(output_dir).resolve(), Path(config["attachments_dir"]))
 
     api = Api(pat)
     try:
-        tables, id_to_title, stats = discover(api)
+        tables, id_to_title, stats = discover(api, config)
     except Exception as e:
         # Most commonly an invalid/expired token or a missing schema.bases:read scope.
         raise SystemExit(
@@ -400,13 +587,19 @@ def main():
             "'schema.bases:read' and 'data.records:read'."
         )
 
-    files_written = write(tables, id_to_title, output_dir)
+    if config["body"] not in (BODY_FIELDS, BODY_NONE) and not any(t["body_field"] for t in tables):
+        print(f"  ! A2O_BODY field '{config['body']}' was not found in any table; bodies will be empty.")
+
+    files_written, att_stats = write(tables, id_to_title, config)
 
     print(
         "\nDone. "
         f"{stats['bases']} base(s), {stats['tables']} table(s), "
         f"{stats['records']} record(s) -> {files_written} file(s) in '{output_dir}/'."
         + (f" Skipped {stats['skipped_bases']} base(s)." if stats["skipped_bases"] else "")
+        + f"\nAttachments in '{config['attachments_dir']}/': {att_stats['downloaded']} downloaded, "
+        f"{att_stats['reused']} already present"
+        + (f", {att_stats['failed']} FAILED (re-run to retry)." if att_stats["failed"] else ".")
     )
 
 
